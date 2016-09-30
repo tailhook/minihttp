@@ -54,6 +54,7 @@ extern crate netbuf;
 pub mod request;
 pub mod response;
 pub mod server;
+pub mod parser;
 
 use std::io;
 use std::net::SocketAddr;
@@ -156,7 +157,7 @@ pub fn core_serve(handle: &Handle, addr: SocketAddr) {
         println!("Got incomming connection: {:?}, {:?}", stream, addr);
         handle2.spawn(
             server::HttpServer::new(stream)
-            .map(|i| {println!("done"); })
+            .map(|_| {println!("done"); })
             .map_err(|err| { println!("Got Error: {:?}", err); }));
         // * Spawn handler for connection;
         // * Count handled connections;

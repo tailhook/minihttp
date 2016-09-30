@@ -4,6 +4,7 @@ use futures::{Future, Poll, Async};
 use tokio_core::io::{Io};
 use netbuf::Buf;
 
+// use super::parser::parse;
 
 /// Http Server handler.
 ///
@@ -26,7 +27,6 @@ pub struct HttpServer<S> {
 impl<S> HttpServer<S>
     where S: Io,
 {
-
     pub fn new(stream: S) -> HttpServer<S> {
         HttpServer {
             stream: stream,
@@ -73,6 +73,7 @@ impl<S> Future for HttpServer<S>
                 Err(e) => return Err(e.into()),
             };
             match read {
+                // NOTE: should we try flushing pending data?
                 Some(0) => return Ok(Async::Ready(())),
                 Some(_) | None => {},
             }
@@ -99,11 +100,11 @@ impl<S> Future for HttpServer<S>
                 };
                 println!("written {} bytes", written);
             }
+            // Try flush pending writes;
 
             if not_ready {
                 return Ok(Async::NotReady);
             }
-            // TODO: add exit condition
         }
     }
 }
