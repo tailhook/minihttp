@@ -1,11 +1,13 @@
-use std::io;
-use std::fmt;
+// use std::io;
+// use std::fmt;
 use std::convert::From;
+use std::str;
+use std::ascii::AsciiExt;
 
-use bytes::buf::BlockBuf;
 use httparse;
-use tokio_proto::Parse;
-use tokio_proto::pipeline::Frame;
+use futures::{Async, Poll};
+
+use super::error::Error;
 
 /// Enum representing HTTP request methods.
 ///
@@ -18,7 +20,7 @@ use tokio_proto::pipeline::Frame;
 ///     }
 /// ```
 #[derive(Debug,PartialEq)]
-pub enum Method {
+pub enum Method<'buf> {
     Options,
     Get,
     Head,
@@ -27,13 +29,13 @@ pub enum Method {
     Delete,
     Trace,
     Connect,
-    Other(String),
+    Other(&'buf str),
 }
 
-impl<'a> From<&'a str> for Method
+impl<'a> From<&'a str> for Method<'a>
 {
     
-    fn from(s: &'a str) -> Method {
+    fn from(s: &'a str) -> Method<'a> {
         match s {
             "OPTIONS"   => Method::Options,
             "GET"       => Method::Get,
@@ -43,145 +45,90 @@ impl<'a> From<&'a str> for Method
             "DELETE"    => Method::Delete,
             "TRACE"     => Method::Trace,
             "CONNECT"   => Method::Connect,
-            s => Method::Other(s.to_string()),
+            s => Method::Other(s),
         }
     }
 }
 
-/// Enum reprsenting HTTP version.
-#[derive(Debug, Clone)]
-pub enum Version {
-    Http10,
-    Http11,
-}
+// /// Enum reprsenting HTTP version.
+// #[derive(Debug, Clone)]
+// pub enum Version {
+//     Http10,
+//     Http11,
+// }
+// impl fmt::Display for Version {
+//     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+//         match *self {
+//             Version::Http10 => f.write_str("HTTP/1.0"),
+//             Version::Http11 => f.write_str("HTTP/1.1"),
+//         }
+//     }
+// }
 
 /// Request struct
 ///
 /// some known headers may be moved to upper structure (ie, Host)
 #[derive(Debug,PartialEq)]
-pub struct Request {
-    pub method: Method,
-    pub path: String,
+pub struct Request<'headers, 'buf: 'headers> {
+    pub method: Method<'buf>,
+    pub path: &'buf str,
     pub version: u8,
-    // pub host: String,
 
-    // TODO: implement
-    // headers: Vec<(str, str)>,
+    request_size: usize,
+    headers: &'headers mut [httparse::Header<'buf>],
 
-    // body: &'a str,
+    host: Option<&'buf str>,
 }
 
-impl Request {
-    pub fn new() -> Request {
+impl<'h, 'b> Request<'h, 'b> {
+    pub fn new(headers: &'h mut [httparse::Header<'b>]) -> Request<'h, 'b> {
         Request {
-            method: Method::Get,
+            method: Method::from(""),
             version: 0,
-            path: "".to_string(),
+            path: "",
+            request_size: 0,
+            headers: headers,
+            host: None,
         }
     }
 
-    pub fn from(&mut self, req: httparse::Request) -> io::Result<()> {
-        self.method = Method::from(req.method.unwrap());
-        self.version = req.version.unwrap();
-        self.path = "".to_string();
-        Ok(())
-    }
-}
+    pub fn parse(&mut self, buf: &'b [u8]) -> Poll<(), Error> {
+        {
+            let mut parser = httparse::Request::new(self.headers);
 
-
-pub struct Parser;
-
-
-impl fmt::Display for Version {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match *self {
-            Version::Http10 => f.write_str("HTTP/1.0"),
-            Version::Http11 => f.write_str("HTTP/1.1"),
-        }
-    }
-}
-
-impl fmt::Display for Request {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "minihttp::Request {} {}", self.path, self.version)
-    }
-}
-
-impl Parse for Parser {
-    type Out = Frame<Request, (), io::Error>;
-
-    fn parse(&mut self, buf: &mut BlockBuf) -> Option<Self::Out> {
-        // Only compact if needed
-        if !buf.is_compact() {
-            buf.compact();
-        }
-
-        let mut n = 0;
-
-        let res = {
-            // TODO: we should grow this headers array if parsing fails and asks for
-            //       more headers
-            let mut headers = [httparse::EMPTY_HEADER; 16];
-            let mut r = httparse::Request::new(&mut headers);
-            let status = match r.parse(buf.bytes().expect("buffer not compact")) {
-                Ok(status) => status,
+            let amt = match parser.parse(buf) {
+                Ok(httparse::Status::Complete(amt)) => amt,
+                Ok(httparse::Status::Partial) => {
+                    return Ok(Async::NotReady)
+                },
                 Err(e) => {
-                    println!("Got error: {}", e);
-                    return Some(Frame::Error(
-                        io::Error::new(
-                            io::ErrorKind::Other,
-                            format!("failed to parse http request: {}", e)
-                        )));
+                    return Err(Error::ParseError(e))
                 }
             };
-
-            match status {
-                httparse::Status::Complete(amt) => {
-                    n = amt;
-                    let method = match r.method.unwrap().to_uppercase().as_str() {
-                        "GET" => Method::Get,
-                        "HEAD" => Method::Head,
-                        "POST" => Method::Post,
-                        "PUT" => Method::Put,
-                        "DELETE" => Method::Delete,
-                        m => Method::Other(m.to_string()),
-                    };
-
-                    //let mut h = "http://example.com".to_string();
-                    //h.push_str(r.path.unwrap());
-                    //let res = Url::parse(h.as_str()).unwrap();
-                    // println!("Parsed: {:?}", res);
-                    // println!("Parsed path: {:?}", res.path());
-                    // println!("Parsed query: {:?}", res.query().unwrap());
-
-                    Some(Frame::Message(Request {
-                        method: method,
-                        path: r.path.unwrap().to_string(),
-                        version: r.version.unwrap(),
-                        //headers: r.headers
-                        //    .iter()
-                        //    .map(|h| (toslice(h.name.as_bytes()), toslice(h.value)))
-                        //    .collect(),
-                        //data: None,
-                    }))
-                }
-                httparse::Status::Partial => {
-                    None
+            self.request_size = amt;
+            self.method = Method::from(parser.method.unwrap());
+            self.version = parser.version.unwrap();
+            self.path = parser.path.unwrap();
+        }
+        // process headers;
+        for header in self.headers.iter(){
+            println!("{:?}", header);
+            if header.name.eq_ignore_ascii_case("host") {
+                self.host = match str::from_utf8(header.value) {
+                    Ok(val) => Some(val),
+                    Err(_) => None,
                 }
             }
         };
-
-        match res {
-            Some(Frame::Message(_)) => {
-                buf.shift(n);
-            }
-            _ => {}
-        };
-        res
+        Ok(Async::Ready(()))
     }
 
-    fn done(&mut self, _: &mut BlockBuf) -> Option<Self::Out> {
-        Some(Frame::Done)
-        // TODO: must check if request body is fully read;
+    pub fn request_size(&self) -> usize {
+        self.request_size
+    }
+
+    /// Returns value of Host header
+    pub fn host(&self) -> Option<&'b str> {
+        self.host
     }
 }

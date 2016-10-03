@@ -3,7 +3,9 @@ use std::io;
 use futures::{Future, Poll, Async};
 use tokio_core::io::{Io};
 use netbuf::Buf;
+use httparse;
 
+use request::Request;
 // use super::parser::parse;
 
 /// Http Server handler.
@@ -34,6 +36,17 @@ impl<S> HttpServer<S>
             outbuf: Buf::new(),
         }
     }
+
+    fn handle(&self) {
+        if self.inbuf.len() > 0 {
+            let mut headers = [httparse::EMPTY_HEADER; 16];
+            let mut req = Request::new(&mut headers);
+            match req.parse(&self.inbuf[..]) {
+                Ok(_) => {},
+                Err(_) => {},
+            }
+        }
+    }
 }
 
 
@@ -55,6 +68,8 @@ impl<S> Future for HttpServer<S>
             let mut not_ready = false;
 
             // Try flush pending writes;
+            //  ignore would block; as we always notready
+            //  until 0 bytes read or response closes connection
             match self.stream.flush() {
                 Ok(_) => {},
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
@@ -81,12 +96,38 @@ impl<S> Future for HttpServer<S>
 
             // Now we have to (a) parse it (b) process it and (c) serialize it;
             // fake it by echoing:
-            if self.inbuf.len() > 0 {   // TODO: fix netbuf::Buf.write([]) empty buf
-                match self.inbuf.write_to(&mut self.outbuf) {
-                    Ok(b) => {println!("Copied {} bytes", b);},
-                    Err(e) => return Err(e.into()),
-                }
-            }
+            self.handle();
+            // if self.inbuf.len() > 0 {
+            //     let mut headers = [httparse::EMPTY_HEADER; 16];
+            //     let mut req = Request::new(&mut headers);
+            //     match req.parse(&self.inbuf[..]) {
+            //         Ok(_) => {},
+            //         Err(_) => {},
+            //     }
+            //     // TODO: try parsing bytes into HttpRequest;
+            //     //      do until complete request is parsed (or error);
+            //     //      then pass request to service -> wait response;
+            //     // here we need currently available request;
+            //     //  that we can start parsing in;
+            //     //  as soon as it parsed:
+            //     //      we must pass it to service;
+            //     //      create new empty request (or not);
+            //     //      wait for new requests;
+            //     //  Problem: Request body:
+            //     //      we can't parse into new request case it must be
+            //     //      body of previous request.
+            //     //  Solution:
+            //     //      advance state of parser to body reader;
+            //     //      read or skip body;
+            //     //      advance state of parser to initial;
+
+            //     // self.parser.parse(&self.inbuf[..]).unwrap();
+
+            //     // match self.inbuf.write_to(&mut self.outbuf) {
+            //     //     Ok(b) => {println!("Copied {} bytes", b);},
+            //     //     Err(e) => return Err(e.into()),
+            //     // }
+            // }
 
             // Try write out buffer;
             if self.outbuf.len() > 0 {
