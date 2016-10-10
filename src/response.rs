@@ -1,31 +1,41 @@
 use std::io;
 use std::fmt;
-use std::fmt::Write;
+use std::io::Write;
 
-use bytes::buf::{BlockBuf, Fmt};
-use bytes::MutBuf;
-use tokio_proto::Serialize;
-use tokio_proto::pipeline::Frame;
+use futures;
+use futures::{Poll, Async};
+use netbuf::Buf;
 
+
+#[derive(Debug, PartialEq)]
+enum ResponseState {
+    CollectHeaders,
+    WriteBody,
+}
 
 #[derive(Debug)]
 pub struct Response {
     code: u16,
     reason: String,
+    version: u8,
+    buf: Buf,
+    state: ResponseState,
 
-    pub headers: Option<String>,
+    headers: Vec<String>,
     pub body: Option<String>,
 }
 
-pub struct Serializer;
-
 impl Response {
 
-    pub fn new() -> Response {
+    pub fn new(version: u8) -> Response {
         Response {
             code: 200,
             reason: "OK".to_string(),
-            headers: None,
+            version: version,
+            buf: Buf::new(),
+            state: ResponseState::CollectHeaders,
+
+            headers: Vec::with_capacity(16*2),
             body: None,
         }
     }
@@ -37,31 +47,66 @@ impl Response {
         self.reason = reason;
     }
 
-}
-
-impl fmt::Display for Response {
-
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "minihttp::Response {} {}", self.code, self.reason)
-    }
-}
-
-impl Serialize for Serializer {
-    type In = Frame<Response, (), io::Error>;
-
-    fn serialize(&mut self, msg: Self::In, buf: &mut BlockBuf) {
-        // println!("serialize: {:?}", msg);
-        // TODO: serialize Response (Status + Headers);
-        //      serialize Body (sized body / streaming body);
-        match msg {
-            Frame::Message(_) => {
-                write!(Fmt(buf), "HTTP/1.1 200 OK\r\n").unwrap();
-                buf.write_slice(b"Content-Length: 12\r\n");
-                buf.write_slice(b"\r\n");
-                buf.write_slice(b"Hello, world");
-                // buf.write_slice(b"\r\n");
+    pub fn write_to<W: io::Write>(&mut self, stream: &mut W) -> Poll<(), io::Error> {
+        // TODO: maybe pass buf in new so it can't be touched
+        //      and no write_to interface exposed;
+        match self.buf.write_to(stream) {
+            Ok(b) => {
+                Ok(Async::Ready(()))
             },
-            _ => {},
-        };
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => Ok(Async::NotReady),
+            Err(e) => Err(e),
+        }
     }
+
+    pub fn with_header(&mut self, header: String, value: String) {
+        assert_eq!(self.state, ResponseState::CollectHeaders);
+        self.headers.push(header);
+        self.headers.push(value);
+    }
+
+    pub fn with_body(&mut self, buf: &[u8]) {
+        if self.state == ResponseState::CollectHeaders {
+            self.flush_headers();
+            self.state = ResponseState::WriteBody;
+        }
+        self.buf.write(buf);
+        // write body
+    }
+
+    pub fn flush_headers(&mut self) {
+        // self.buf.write();
+        assert_eq!(self.state, ResponseState::CollectHeaders);
+        write!(self.buf, "HTTP/1.{} {} {}\r\n",
+               self.version, self.code, self.reason);
+        for (h, v) in self.headers.chunks(2).map(|pair| (&pair[0], &pair[1])) {
+            write!(self.buf, "{}: {}\r\n", h, v);
+        }
+        self.buf.write(b"Connection: close\r\n");
+        self.buf.write(b"\r\n");
+    }
+
+    pub fn done(&mut self) {
+        loop {
+            match self.state {
+                ResponseState::CollectHeaders => {
+                    self.flush_headers();
+                    self.state = ResponseState::WriteBody;
+                },
+                ResponseState::WriteBody => {
+                    return
+                }
+            }
+        }
+    }
+}
+
+
+fn handle(req: super::request::Request) -> futures::Finished<Box<Response>, io::Error> {
+    //let mut resp = req.make_response();
+    let mut resp = Response::new(req.version);
+    resp.set_status(200);
+    // resp.write_body("Hello World");     // -> maybe start flushing data
+    let resp = Box::new(resp);
+    futures::finished(resp)
 }

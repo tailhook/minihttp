@@ -59,7 +59,7 @@ extern crate httparse;
 extern crate tokio_core;
 extern crate tokio_proto;
 extern crate tokio_service;
-extern crate url;
+// extern crate url;
 extern crate netbuf;
 
 pub mod request;
@@ -161,15 +161,22 @@ pub use error::Error;
 //         pipeline::Server::new(server, transport)
 //     })
 // }
+use std::io;
+use futures::Async;
 
 
-pub fn core_serve(handle: &Handle, addr: SocketAddr) {
+pub fn core_serve<S, H>(handle: &Handle, addr: SocketAddr, service: H)
+    where H: server::NewHandler<Handler=S> + 'static,
+          S: server::HttpHandler<Response=response::Response, Error=io::Error> + 'static,
+{
     let listener = TcpListener::bind(&addr, handle).unwrap();
     let handle2 = handle.clone();
+
     handle.spawn(listener.incoming().for_each(move |(stream, addr)| {
         println!("Got incomming connection: {:?}, {:?}", stream, addr);
+        let handler = service.new_handler();
         handle2.spawn(
-            server::HttpServer::new(stream)
+            server::HttpServer::new(stream, handler)
             .map(|_| {println!("done"); })
             .map_err(|err| { println!("Got Error: {:?}", err); }));
         // * Spawn handler for connection;

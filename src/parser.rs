@@ -106,34 +106,3 @@ pub fn parse<'a>(buf: &'a [u8], s: State, _: &mut super::request::Request) -> io
     };
     Ok(res)
 }
-
-
-struct Parser {
-    request_size: usize,    // data to skip when done;
-}
-
-impl Parser {
-    
-    fn new() -> Parser {
-        Parser {
-            request_size: 0,
-        }
-    }
-
-    fn parse(&mut self, buf: &[u8]) -> Poll<(), io::Error> {
-        let mut headers = [httparse::EMPTY_HEADER; 16];
-        let mut parser = httparse::Request::new(&mut headers);
-        let amt = match parser.parse(buf) {
-            Ok(httparse::Status::Complete(amt)) => {
-                self.request_size = amt;
-            },
-            Ok(httparse::Status::Partial) => {
-                return Ok(Async::NotReady)
-            },
-            Err(e) => {
-                return Err(io::Error::new(io::ErrorKind::Other, e.to_string()))
-            },
-        };
-        Ok(Async::Ready(()))
-    }
-}

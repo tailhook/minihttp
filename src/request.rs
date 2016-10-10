@@ -1,13 +1,18 @@
-// use std::io;
+use std::io;
 // use std::fmt;
 use std::convert::From;
 use std::str;
 use std::ascii::AsciiExt;
 
 use httparse;
+use netbuf::Buf;
 use futures::{Async, Poll};
 
 use super::error::Error;
+use super::response::Response;
+
+
+type Slice = (usize, usize);
 
 /// Enum representing HTTP request methods.
 ///
@@ -20,7 +25,7 @@ use super::error::Error;
 ///     }
 /// ```
 #[derive(Debug,PartialEq)]
-pub enum Method<'buf> {
+pub enum Method {
     Options,
     Get,
     Head,
@@ -29,13 +34,13 @@ pub enum Method<'buf> {
     Delete,
     Trace,
     Connect,
-    Other(&'buf str),
+    Other(String),
 }
 
-impl<'a> From<&'a str> for Method<'a>
+impl<'a> From<&'a str> for Method
 {
     
-    fn from(s: &'a str) -> Method<'a> {
+    fn from(s: &'a str) -> Method {
         match s {
             "OPTIONS"   => Method::Options,
             "GET"       => Method::Get,
@@ -45,9 +50,15 @@ impl<'a> From<&'a str> for Method<'a>
             "DELETE"    => Method::Delete,
             "TRACE"     => Method::Trace,
             "CONNECT"   => Method::Connect,
-            s => Method::Other(s),
+            s => Method::Other(s.to_string()),
         }
     }
+}
+
+pub enum Header {
+    Host,
+    ContentType,
+    Raw,
 }
 
 // /// Enum reprsenting HTTP version.
@@ -64,71 +75,141 @@ impl<'a> From<&'a str> for Method<'a>
 //         }
 //     }
 // }
+const MIN_HEADERS_ALLOCATE: usize = 16;
 
 /// Request struct
 ///
 /// some known headers may be moved to upper structure (ie, Host)
-#[derive(Debug,PartialEq)]
-pub struct Request<'headers, 'buf: 'headers> {
-    pub method: Method<'buf>,
-    pub path: &'buf str,
+#[derive(Debug)]
+pub struct Request {
+    pub method: Method,
+    pub path: String,
     pub version: u8,
 
+    buf: Buf,
     request_size: usize,
-    headers: &'headers mut [httparse::Header<'buf>],
+    headers: Vec<(Slice, Slice)>,
 
-    host: Option<&'buf str>,
+    // some known headers
+    host: Option<Slice>,
+    content_type: Option<Slice>,
+    // add more known headers;
+
+    response: Option<Response>,
 }
 
-impl<'h, 'b> Request<'h, 'b> {
-    pub fn new(headers: &'h mut [httparse::Header<'b>]) -> Request<'h, 'b> {
+impl Request {
+    pub fn new() -> Request {
         Request {
             method: Method::from(""),
             version: 0,
-            path: "",
+            path: "".to_string(),
+            buf: Buf::new(),
             request_size: 0,
-            headers: headers,
+            headers:  Vec::with_capacity(MIN_HEADERS_ALLOCATE),
+
             host: None,
+            content_type: None,
+            response: None,
         }
     }
 
-    pub fn parse(&mut self, buf: &'b [u8]) -> Poll<(), Error> {
-        {
-            let mut parser = httparse::Request::new(self.headers);
-
-            let amt = match parser.parse(buf) {
-                Ok(httparse::Status::Complete(amt)) => amt,
-                Ok(httparse::Status::Partial) => {
-                    return Ok(Async::NotReady)
-                },
-                Err(e) => {
-                    return Err(Error::ParseError(e))
-                }
-            };
-            self.request_size = amt;
-            self.method = Method::from(parser.method.unwrap());
-            self.version = parser.version.unwrap();
-            self.path = parser.path.unwrap();
+    pub fn make_response(&mut self) -> &mut Response {
+        if self.response.is_none() {
+            self.response = Some(Response::new(self.version));
         }
-        // process headers;
-        for header in self.headers.iter(){
-            println!("{:?}", header);
-            if header.name.eq_ignore_ascii_case("host") {
-                self.host = match str::from_utf8(header.value) {
-                    Ok(val) => Some(val),
-                    Err(_) => None,
-                }
+        self.response.as_mut().unwrap()
+    }
+
+    pub fn read_from<R: io::Read>(&mut self, stream: &mut R) -> Poll<(), Error> {
+        match self.buf.read_from(stream) {
+            Ok(_) => Ok(Async::Ready(())),
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => Ok(Async::NotReady),
+            Err(e) => Err(Error::ReadError(e)),
+        }
+    }
+
+    pub fn parse(&mut self) {
+        if self.request_size == 0 {
+            self.parse_request()
+        } else {
+            self.parse_body()
+        };
+    }
+
+    pub fn is_ready(&self) -> bool {
+        self.request_size != 0
+    }
+
+    pub fn parse_from<R: io::Read>(&mut self, stream: &mut R) -> Poll<(), Error> {
+        let res = self.read_from(stream);
+        self.parse();
+        res
+    }
+
+    fn parse_request(&mut self) -> Poll<(), Error> {
+        let mut headers = [httparse::EMPTY_HEADER; MIN_HEADERS_ALLOCATE];
+        let mut parser = httparse::Request::new(&mut headers);
+
+        self.request_size = match parser.parse(&self.buf[..]) {
+            Ok(httparse::Status::Complete(amt)) => amt,
+            Ok(httparse::Status::Partial) => {
+                return Ok(Async::NotReady)
+            },
+            Err(e) => {
+                return Err(Error::ParseError(e))
             }
         };
+        self.method = Method::from(parser.method.unwrap());
+        self.version = parser.version.unwrap();
+        self.path = parser.path.unwrap().to_string();
+
+        // process headers;
+        let start = self.buf[..].as_ptr() as usize;
+        let buf_len = self.buf.len() as usize;
+        let toslice = |a: &[u8]| {
+                let start = a.as_ptr() as usize - start;
+                assert!(start < buf_len);
+                (start, start + a.len())
+            };
+        for h in parser.headers.iter() {
+            let name = toslice(h.name.as_bytes());
+            let value = toslice(h.value);
+            self.headers.push((name, value));
+            if h.name.eq_ignore_ascii_case("host") {
+                self.host = Some(value);
+            }
+        }
         Ok(Async::Ready(()))
     }
 
-    pub fn request_size(&self) -> usize {
-        self.request_size
+    fn parse_body(&mut self) -> Poll<(), Error> {
+        Ok(Async::Ready(()))
     }
 
-    /// Returns value of Host header
-    pub fn host(&self) -> Option<&'b str> {
-        self.host
+    // Public interface
+
+    /// Value of Host header
+    pub fn host<'req>(&'req self) -> Option<&'req [u8]> {
+        match self.host {
+            Some(s) => Some(&self.buf[s.0..s.1]),
+            None => None,
+        }
+    }
+
+    /// Value of Content-Type header
+    pub fn content_type<'req>(&'req self) -> Option<&'req [u8]> {
+        match self.content_type {
+            Some(s) => Some(&self.buf[s.0..s.1]),
+            None => None,
+        }
+    }
+
+    // interface to body
+
+    /// Read request body into buffer.
+    pub fn read_body(&mut self, buf: &mut [u8]) -> Poll<usize, Error> {
+        // this must/should be hooked to underlying tcp stream
+        Ok(Async::NotReady)
     }
 }
