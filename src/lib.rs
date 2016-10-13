@@ -58,6 +58,7 @@ pub mod response;
 pub mod server;
 pub mod headers;
 mod error;
+mod new_handler;
 
 use std::net::SocketAddr;
 
