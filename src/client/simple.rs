@@ -1,5 +1,6 @@
 use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::sync::Arc;
+use std::time::Duration;
 
 use url::{Url, Host};
 use futures::{IntoFuture, Future, Sink};
@@ -8,6 +9,7 @@ use futures_cpupool::CpuPool;
 use ns_std_threaded::ThreadedResolver;
 use tokio_core::reactor::Handle;
 use tokio_core::net::TcpStream;
+use tokio_core::reactor::Timeout;
 
 use {OptFuture};
 use client::errors::Error;
@@ -60,11 +62,11 @@ pub fn fetch_once_buffered(url: Url, handle: &Handle)
         let (codec, receiver) = Buffered::get(url);
         let proto = Proto::new(sock, &Arc::new(Config::new()));
         proto.send(codec)
-        .map(|_| -> Response { unreachable!() })
+        .map(|_| { Timeout::new(Duration::new(10, 0), &handle) })
         .select(receiver.map_err(|_| -> Error { unimplemented!() }))
-        .map(|(response, _)| {
-            response
-        })
         .map_err(|(e, _)| e)
+        .and_then(|(result, _)| {
+            result
+        })
     })) as Box<Future<Item=Response, Error=Error>>
 }
